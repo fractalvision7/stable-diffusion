@@ -1,262 +1,274 @@
 import os
-import glob
+import zipfile
+import io
 import torch
-import argparse
-import math
-import time
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-from PIL import Image
-from diffusers import (
-    StableDiffusionPipeline, 
-    UNet2DConditionModel, 
-    DDPMScheduler, 
-    AutoencoderKL,
-    LMSDiscreteScheduler
-)
-from transformers import CLIPTextModel, CLIPTokenizer
 import torch.nn.functional as F
-from accelerate import Accelerator
-from tqdm import tqdm
-import wandb
-from diffusers.optimization import get_cosine_schedule_with_warmup
+import argparse
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
 import random
 import numpy as np
+from torchvision import transforms
+from tqdm import tqdm
 from datetime import datetime
+import warnings
+from accelerate import Accelerator
+from diffusers import StableDiffusionPipeline, UNet2DConditionModel, DDPMScheduler, AutoencoderKL
+from diffusers.optimization import get_cosine_schedule_with_warmup
+from transformers import CLIPTextModel, CLIPTokenizer, AutoTokenizer, PretrainedConfig
 
-class TextImageDataset(Dataset):
-    def __init__(self, image_dir, caption_dir, image_size=512):
-        self.image_dir = image_dir
-        self.caption_dir = caption_dir
+# Suppress warnings
+warnings.filterwarnings("ignore")
+
+class SimpleAnimeDataset(Dataset):
+    """Simple dataset for anime fine-tuning"""
+    
+    def __init__(self, zip_path, tokenizer, image_size=512, max_samples=None):
+        self.zip_path = zip_path
         self.image_size = image_size
+        self.tokenizer = tokenizer
         
-        print(f"🔍 Scanning dataset...")
-        print(f"  Images: {image_dir}")
-        print(f"  Captions: {caption_dir}")
+        print(f"📦 Loading anime dataset from {zip_path}")
         
-        # Find all images
-        image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.webp', '*.JPG', '*.JPEG', '*.PNG']
+        # Open ZIP
+        self.zip_file = zipfile.ZipFile(zip_path, 'r')
+        all_files = self.zip_file.namelist()
+        
+        # Find image files
         self.image_files = []
+        image_exts = ['.jpg', '.jpeg', '.png', '.bmp', '.webp']
         
-        for ext in image_extensions:
-            found = glob.glob(os.path.join(image_dir, ext))
-            self.image_files.extend(found)
+        for file in all_files:
+            if any(file.lower().endswith(ext) for ext in image_exts):
+                self.image_files.append(file)
         
-        print(f"  Found {len(self.image_files)} images")
+        print(f"Found {len(self.image_files)} anime image files")
         
-        # Match images with captions
-        self.valid_pairs = []
-        for img_path in self.image_files:
-            base_name = os.path.splitext(os.path.basename(img_path))[0]
-            caption_file = os.path.join(caption_dir, f"{base_name}.txt")
+        # Get captions
+        self.captions = {}
+        for img_file in self.image_files[:max_samples] if max_samples else self.image_files:
+            img_name = os.path.basename(img_file)
+            base_name = os.path.splitext(img_name)[0]
+            caption_file = f"{base_name}.txt"
             
-            if os.path.exists(caption_file):
+            if caption_file in all_files:
                 try:
-                    with open(caption_file, 'r', encoding='utf-8') as f:
-                        caption = f.read().strip()
-                    if caption:
-                        self.valid_pairs.append((img_path, caption))
+                    with self.zip_file.open(caption_file) as f:
+                        caption = f.read().decode('utf-8', errors='ignore').strip()
                 except:
-                    continue
+                    caption = f"anime style {base_name}"
+            else:
+                caption = f"anime style {base_name}"
+            
+            self.captions[img_file] = caption
         
-        print(f"✅ Valid pairs: {len(self.valid_pairs)}")
+        self.valid_files = list(self.captions.keys())[:max_samples] if max_samples else list(self.captions.keys())
+        print(f"✅ Loaded {len(self.valid_files)} anime image-caption pairs")
         
-        if len(self.valid_pairs) == 0:
-            raise ValueError("❌ No valid image-caption pairs found!")
-        
-        # Augmentations
+        # Transform
         self.transform = transforms.Compose([
             transforms.Resize(image_size),
             transforms.CenterCrop(image_size),
-            transforms.RandomHorizontalFlip(p=0.5),
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5])
         ])
     
     def __len__(self):
-        return len(self.valid_pairs)
+        return len(self.valid_files)
     
     def __getitem__(self, idx):
-        img_path, caption = self.valid_pairs[idx]
+        img_file = self.valid_files[idx]
         
         try:
-            image = Image.open(img_path).convert("RGB")
+            # Load image
+            with self.zip_file.open(img_file) as f:
+                img_data = f.read()
+            
+            image = Image.open(io.BytesIO(img_data)).convert('RGB')
             image = self.transform(image)
-            return {"pixel_values": image, "caption": caption}
-        except:
-            # Fallback to another random image
-            return self.__getitem__(random.randint(0, len(self.valid_pairs)-1))
+            
+            # Get caption
+            caption = self.captions[img_file]
+            
+            # Tokenize
+            text_inputs = self.tokenizer(
+                caption,
+                padding="max_length",
+                max_length=77,
+                truncation=True,
+                return_tensors="pt"
+            )
+            input_ids = text_inputs.input_ids[0]
+            
+            return {
+                'pixel_values': image,
+                'input_ids': input_ids,
+                'caption': caption
+            }
+        except Exception as e:
+            print(f"Error loading {img_file}: {e}")
+            return self.__getitem__((idx + 1) % len(self))
+    
+    def close(self):
+        self.zip_file.close()
+
+def collate_fn(examples):
+    pixel_values = torch.stack([example["pixel_values"] for example in examples])
+    input_ids = torch.stack([example["input_ids"] for example in examples])
+    return {"pixel_values": pixel_values, "input_ids": input_ids}
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Stable Diffusion (Optimized for 5 hours)")
+    parser = argparse.ArgumentParser(description="Simple Anime Stable Diffusion Fine-tuning")
     
-    # Dataset
-    parser.add_argument("--train_data_dir", type=str, default="./training_dataset/images",
-                       help="Directory with images")
-    parser.add_argument("--caption_dir", type=str, default="./training_dataset",
-                       help="Directory with caption files")
-    parser.add_argument("--output_dir", type=str, default="./sd-finetuned",
-                       help="Output directory")
-    
-    # Model
-    parser.add_argument("--pretrained_model", type=str, default="runwayml/stable-diffusion-v1-5",
-                       help="Base model")
-    parser.add_argument("--resolution", type=int, default=512,
-                       help="Training resolution")
-    
-    # Training (OPTIMIZED FOR 5 HOURS)
-    parser.add_argument("--batch_size", type=int, default=4,  # Fits in 30GB
-                       help="Batch size")
-    parser.add_argument("--grad_accum", type=int, default=1,
-                       help="Gradient accumulation steps")
-    parser.add_argument("--epochs", type=int, default=2,
-                       help="Number of epochs")
-    parser.add_argument("--lr", type=float, default=1e-5,
-                       help="Learning rate")
-    parser.add_argument("--warmup", type=int, default=100,
-                       help="Warmup steps")
-    
-    # Other
-    parser.add_argument("--workers", type=int, default=4,
-                       help="Data loader workers")
-    parser.add_argument("--save_every", type=int, default=200,
-                       help="Save checkpoint every N steps")
-    parser.add_argument("--log_every", type=int, default=20,
-                       help="Log every N steps")
-    parser.add_argument("--use_wandb", action="store_true",
-                       help="Use Weights & Biases")
-    parser.add_argument("--seed", type=int, default=42,
-                       help="Random seed")
+    parser.add_argument("--zip_path", type=str, default="training_dataset.zip")
+    parser.add_argument("--model_name", type=str, default="runwayml/stable-diffusion-v1-5")
+    parser.add_argument("--output_dir", type=str, default="./anime_model")
+    parser.add_argument("--resolution", type=int, default=512)
+    parser.add_argument("--train_batch_size", type=int, default=2)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    parser.add_argument("--learning_rate", type=float, default=1e-5)
+    parser.add_argument("--lr_warmup_steps", type=int, default=500)
+    parser.add_argument("--max_train_steps", type=int, default=2000)
+    parser.add_argument("--checkpointing_steps", type=int, default=500)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--mixed_precision", type=str, default="fp16")
+    parser.add_argument("--max_samples", type=int, default=8000)
     
     args = parser.parse_args()
     
-    # Calculate steps for 5 hours (estimated 4 sec/step on 30GB GPU)
-    # 5 hours * 3600 seconds / 4 seconds per step ≈ 4500 steps
-    # But with 8K images: 8000/4 = 2000 steps per epoch, 2 epochs = 4000 steps
-    total_steps = 2000  # Conservative estimate for 5 hours
-    
-    print("\n" + "="*60)
-    print("🚀 STABLE DIFFUSION FINE-TUNING")
-    print("="*60)
-    print(f"📊 Config:")
-    print(f"  • Model: {args.pretrained_model}")
-    print(f"  • Images: {args.train_data_dir}")
-    print(f"  • Batch size: {args.batch_size}")
-    print(f"  • LR: {args.lr}")
-    print(f"  • Target steps: {total_steps} (~5 hours)")
-    print(f"  • Resolution: {args.resolution}")
-    print(f"  • Output: {args.output_dir}")
-    print("="*60)
-    
-    # Setup
-    os.makedirs(args.output_dir, exist_ok=True)
-    os.makedirs(os.path.join(args.output_dir, "samples"), exist_ok=True)
-    
     # Set seed
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
     random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
     
     # Initialize accelerator
     accelerator = Accelerator(
-        mixed_precision="fp16",
-        gradient_accumulation_steps=args.grad_accum,
-        log_with="wandb" if args.use_wandb else None,
-        project_dir=args.output_dir
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision=args.mixed_precision,
     )
     
-    if args.use_wandb and accelerator.is_main_process:
-        wandb.init(project="sd-finetune-5hr", config=vars(args))
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    print(f"🔧 Loading model: {args.model_name}")
     
     # Load models
-    print("🔄 Loading models...")
-    tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model, subfolder="tokenizer")
-    text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model, subfolder="text_encoder")
-    vae = AutoencoderKL.from_pretrained(args.pretrained_model, subfolder="vae")
-    unet = UNet2DConditionModel.from_pretrained(args.pretrained_model, subfolder="unet")
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model, subfolder="scheduler")
+    tokenizer = CLIPTokenizer.from_pretrained(
+        args.model_name,
+        subfolder="tokenizer",
+    )
     
-    # Freeze models
+    text_encoder = CLIPTextModel.from_pretrained(
+        args.model_name,
+        subfolder="text_encoder",
+    )
+    
+    vae = AutoencoderKL.from_pretrained(
+        args.model_name,
+        subfolder="vae",
+    )
+    
+    unet = UNet2DConditionModel.from_pretrained(
+        args.model_name,
+        subfolder="unet",
+    )
+    
+    noise_scheduler = DDPMScheduler.from_pretrained(
+        args.model_name,
+        subfolder="scheduler",
+    )
+    
+    # Freeze VAE and text encoder
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     
-    # Dataset
-    print("📦 Loading dataset...")
-    dataset = TextImageDataset(args.train_data_dir, args.caption_dir, args.resolution)
-    dataloader = DataLoader(
-        dataset, 
-        batch_size=args.batch_size, 
+    # Enable gradient checkpointing to save memory
+    unet.enable_gradient_checkpointing()
+    
+    print(f"✅ Models loaded successfully")
+    print(f"   Trainable parameters: {sum(p.numel() for p in unet.parameters() if p.requires_grad):,}")
+    
+    # Load dataset
+    print("📦 Loading anime dataset...")
+    train_dataset = SimpleAnimeDataset(
+        zip_path=args.zip_path,
+        tokenizer=tokenizer,
+        image_size=args.resolution,
+        max_samples=args.max_samples
+    )
+    
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=args.train_batch_size,
         shuffle=True,
-        num_workers=args.workers,
+        collate_fn=collate_fn,
+        num_workers=2,
         pin_memory=True,
-        drop_last=True
     )
     
     # Optimizer
     optimizer = torch.optim.AdamW(
         unet.parameters(),
-        lr=args.lr,
-        weight_decay=1e-2
+        lr=args.learning_rate,
+        betas=(0.9, 0.999),
+        weight_decay=1e-2,
     )
     
-    # Scheduler
+    # Learning rate scheduler
     lr_scheduler = get_cosine_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=args.warmup,
-        num_training_steps=total_steps
+        optimizer=optimizer,
+        num_warmup_steps=args.lr_warmup_steps,
+        num_training_steps=args.max_train_steps,
     )
     
     # Prepare with accelerator
-    unet, optimizer, dataloader, lr_scheduler = accelerator.prepare(
-        unet, optimizer, dataloader, lr_scheduler
+    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        unet, optimizer, train_dataloader, lr_scheduler
     )
+    
+    # Move models to device
     vae.to(accelerator.device)
     text_encoder.to(accelerator.device)
     
     # Training
-    print("🔥 Starting training...")
-    global_step = 0
-    start_time = time.time()
+    print(f"\n🔥 Starting anime fine-tuning")
+    print(f"   Dataset: {len(train_dataset)} anime images")
+    print(f"   Batch size: {args.train_batch_size}")
+    print(f"   Gradient accumulation: {args.gradient_accumulation_steps}")
+    print(f"   Total steps: {args.max_train_steps}")
+    print(f"   Learning rate: {args.learning_rate}")
+    print()
     
-    for epoch in range(args.epochs):
+    global_step = 0
+    progress_bar = tqdm(range(args.max_train_steps), desc="Training")
+    
+    for epoch in range(100):
         unet.train()
-        progress_bar = tqdm(total=len(dataloader), desc=f"Epoch {epoch+1}")
         
-        for batch in dataloader:
+        for batch in train_dataloader:
             with accelerator.accumulate(unet):
-                # Get batch
-                images = batch["pixel_values"].to(accelerator.device)
-                captions = batch["caption"]
+                # Convert images to latents
+                latents = vae.encode(batch["pixel_values"].to(accelerator.device)).latent_dist.sample()
+                latents = latents * 0.18215
                 
-                # Encode to latents
-                with torch.no_grad():
-                    latents = vae.encode(images).latent_dist.sample() * 0.18215
-                
-                # Add noise
+                # Sample noise
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
-                timesteps = torch.randint(0, 1000, (bsz,), device=latents.device).long()
+                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device).long()
+                
+                # Add noise
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
                 
-                # Encode text
-                text_inputs = tokenizer(
-                    captions, 
-                    padding="max_length", 
-                    max_length=77, 
-                    truncation=True, 
-                    return_tensors="pt"
-                ).input_ids.to(accelerator.device)
-                
-                with torch.no_grad():
-                    text_embeddings = text_encoder(text_inputs)[0]
+                # Get text embeddings
+                encoder_hidden_states = text_encoder(batch["input_ids"].to(accelerator.device))[0]
                 
                 # Predict noise
-                noise_pred = unet(noisy_latents, timesteps, text_embeddings).sample
+                noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
                 
-                # Loss
-                loss = F.mse_loss(noise_pred, noise)
+                # Calculate loss
+                loss = F.mse_loss(noise_pred, noise, reduction="mean")
                 
-                # Backward
+                # Backpropagation
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(unet.parameters(), 1.0)
@@ -264,89 +276,62 @@ def main():
                 lr_scheduler.step()
                 optimizer.zero_grad()
             
+            # Check if gradient accumulation is done
             if accelerator.sync_gradients:
-                global_step += 1
                 progress_bar.update(1)
+                global_step += 1
                 
-                # Logging
-                if global_step % args.log_every == 0:
-                    elapsed = time.time() - start_time
-                    steps_per_sec = global_step / elapsed
-                    remaining = (total_steps - global_step) / steps_per_sec if steps_per_sec > 0 else 0
-                    
-                    logs = {
-                        "loss": loss.item(),
-                        "lr": lr_scheduler.get_last_lr()[0],
-                        "step": global_step,
-                        "steps/sec": steps_per_sec,
-                        "eta_minutes": remaining / 60
-                    }
-                    progress_bar.set_postfix(loss=loss.item(), lr=logs["lr"])
-                    
-                    if args.use_wandb and accelerator.is_main_process:
-                        wandb.log(logs)
+                # Log
+                logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
+                progress_bar.set_postfix(**logs)
                 
                 # Save checkpoint
-                if global_step % args.save_every == 0 and accelerator.is_main_process:
-                    save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                    accelerator.save_state(save_path)
-                    
-                    # Save pipeline
-                    pipeline = StableDiffusionPipeline.from_pretrained(
-                        args.pretrained_model,
-                        unet=accelerator.unwrap_model(unet),
-                        text_encoder=text_encoder,
-                        tokenizer=tokenizer,
-                        vae=vae,
-                        scheduler=noise_scheduler,
-                        safety_checker=None,
-                    )
-                    pipeline.save_pretrained(os.path.join(save_path, "pipeline"))
-                    print(f"\n💾 Saved checkpoint {global_step}")
-                
-                # Time check
-                elapsed_hours = (time.time() - start_time) / 3600
-                if elapsed_hours > 4.8:  # Stop at ~4.8 hours to save final model
-                    print(f"\n⏰ Time limit reached ({elapsed_hours:.1f} hours)")
-                    break
+                if global_step % args.checkpointing_steps == 0:
+                    if accelerator.is_main_process:
+                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        accelerator.save_state(save_path)
+                        
+                        # Also save the unet
+                        unet_to_save = accelerator.unwrap_model(unet)
+                        torch.save(unet_to_save.state_dict(), os.path.join(save_path, "unet.pth"))
+                        print(f"💾 Saved checkpoint to {save_path}")
             
-            if global_step >= total_steps:
+            # Break if max steps reached
+            if global_step >= args.max_train_steps:
                 break
         
-        progress_bar.close()
-        
-        if global_step >= total_steps or elapsed_hours > 4.8:
+        if global_step >= args.max_train_steps:
             break
     
     # Save final model
+    print("💾 Saving final model...")
+    
     if accelerator.is_main_process:
-        print("\n💾 Saving final model...")
+        # Save the pipeline
         pipeline = StableDiffusionPipeline.from_pretrained(
-            args.pretrained_model,
+            args.model_name,
             unet=accelerator.unwrap_model(unet),
             text_encoder=text_encoder,
-            tokenizer=tokenizer,
             vae=vae,
+            tokenizer=tokenizer,
             scheduler=noise_scheduler,
             safety_checker=None,
         )
-        pipeline.save_pretrained(args.output_dir)
         
-        # Save config
-        training_time = time.time() - start_time
-        with open(os.path.join(args.output_dir, "training_info.txt"), "w") as f:
-            f.write(f"Training completed in {training_time/3600:.2f} hours\n")
-            f.write(f"Total steps: {global_step}\n")
-            f.write(f"Final loss: {loss.item():.4f}\n")
-            f.write(f"Dataset size: {len(dataset)}\n")
-            f.write(f"Batch size: {args.batch_size}\n")
-            f.write(f"Learning rate: {args.lr}\n")
+        pipeline.save_pretrained(os.path.join(args.output_dir, "anime_pipeline"))
         
-        print(f"✅ Training completed in {training_time/3600:.2f} hours")
+        # Save just the unet weights
+        torch.save(
+            accelerator.unwrap_model(unet).state_dict(),
+            os.path.join(args.output_dir, "unet_weights.pth")
+        )
+        
         print(f"✅ Model saved to {args.output_dir}")
+        print(f"   - Full pipeline: {args.output_dir}/anime_pipeline/")
+        print(f"   - UNet weights: {args.output_dir}/unet_weights.pth")
     
-    if args.use_wandb and accelerator.is_main_process:
-        wandb.finish()
+    train_dataset.close()
+    print("🎉 Training complete!")
 
 if __name__ == "__main__":
     main()

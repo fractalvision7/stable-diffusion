@@ -1,0 +1,27 @@
+# Anime Stable Diffusion Fine-tuning Configuration
+model: "runwayml/stable-diffusion-v1-5"  # or "stabilityai/stable-diffusion-2-1"
+dataset_zip: "training_dataset.zip"
+output_dir: "./anime_lora_model"
+
+# Training parameters
+resolution: 512
+train_batch_size: 4
+gradient_accumulation_steps: 1
+learning_rate: 1e-4
+lr_scheduler: "cosine"
+lr_warmup_steps: 500
+max_train_steps: 3000  # Adjust based on dataset size
+
+# LoRA parameters
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.1
+
+# Inference parameters
+guidance_scale: 7.5
+num_inference_steps: 30
+seed: 42
+
+# Prompts for anime style
+training_prompt_template: "anime artwork of {description}"
+negative_prompt: "blurry, bad quality, distorted, realistic, photo"
