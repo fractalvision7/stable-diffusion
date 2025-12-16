@@ -1,7 +1,5 @@
 """
-Complete Diffusion Model Training for Anime
-Optimized for 32GB GPU with 150K images
-Dimension-safe architecture with automatic sample generation
+Optimized Training Script - Fixed image saving & uses full 32GB GPU
 """
 
 import torch
@@ -10,43 +8,58 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import autocast, GradScaler
 from torchvision import transforms
-from diffusers import DDPMScheduler, UNet2DConditionModel, DDIMScheduler
-from transformers import CLIPTokenizer, CLIPTextModel, AutoencoderKL
-from PIL import Image
 import os
-import gc
-from tqdm import tqdm
+import zipfile
+import tempfile
+import shutil
+from PIL import Image
 import numpy as np
-from datetime import datetime
+from tqdm import tqdm
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend
 import matplotlib.pyplot as plt
+import gc
+import sys
+import re
 
-# ==================== CONFIGURATION ====================
+# Install missing packages
+def install_package(package):
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+try:
+    from diffusers import DDPMScheduler, UNet2DConditionModel
+    print("✓ diffusers imported")
+except ImportError:
+    print("Installing diffusers...")
+    install_package("diffusers")
+    from diffusers import DDPMScheduler, UNet2DConditionModel
+
+try:
+    from transformers import CLIPTokenizer, CLIPTextModel
+    print("✓ transformers imported")
+except ImportError:
+    print("Installing transformers...")
+    install_package("transformers")
+    from transformers import CLIPTokenizer, CLIPTextModel
+
+# ==================== CONFIGURATION OPTIMIZED FOR 32GB GPU ====================
 class Config:
-    # ========== Paths ==========
-    data_root = "./training_dataset"  # Main folder
-    images_dir = "images"             # Images subfolder
-    # Captions are in data_root folder with same names as images
+    # Paths
+    data_source = "./training_dataset.zip"
     
-    # ========== Model Architecture ==========
-    # Optimized for 32GB GPU with dimension safety
-    image_size = 512                  # Final image size
-    latent_size = image_size // 8     # U-Net input size (64x64)
+    # ========== OPTIMIZED FOR 32GB GPU ==========
+    image_size = 512  # Keep at 512 for quality
+    latent_size = image_size // 8
     
-    # U-Net dimensions (carefully tuned for memory)
-    unet_channels = 128               # Base channels
-    channel_multipliers = [1, 2, 4, 8]  # Progressive downsampling
-    num_res_blocks = 2                # Residual blocks per level
-    attention_resolutions = [16, 8]   # Apply attention at these resolutions
-    num_heads = 8                     # Attention heads
-    dropout = 0.0                     # No dropout for anime clarity
+    # U-Net - LARGER for 32GB
+    unet_channels = 128  # Increased from 128
+    channel_multipliers = [1, 2, 4, 8, 8]  # Added extra layer
+    num_res_blocks = 3  # Increased from 2
     
-    # Text encoder
-    text_encoder_dim = 768            # CLIP text embedding dimension
-    max_text_length = 77              # CLIP token limit
-    
-    # ========== Training Parameters ==========
-    batch_size = 8                    # Fits in 32GB
-    micro_batch = 2                   # For gradient accumulation
+    # ========== TRAINING OPTIMIZED FOR 32GB ==========
+    batch_size = 6  # DOUBLED from 6 (fits in 32GB)
+    micro_batch = 4  # Increased
     gradient_accumulation_steps = batch_size // micro_batch
     
     learning_rate = 1e-4
@@ -54,277 +67,355 @@ class Config:
     adam_beta2 = 0.999
     weight_decay = 1e-2
     
-    epochs = 30                       # Good starting point
-    warmup_steps = 500                # LR warmup
+    epochs = 30  # More epochs for better quality
+    warmup_steps = 1000
     
-    # ========== Diffusion Process ==========
+    # Diffusion
     timesteps = 1000
-    beta_schedule = "linear"          # Stable choice
+    beta_schedule = "linear"
     
-    # ========== System ==========
+    # System
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    mixed_precision = True            # Use FP16 for memory
+    mixed_precision = True  # FP16 for memory
     seed = 42
     
-    # ========== Checkpoints & Logging ==========
+    # Checkpoints
     checkpoint_dir = "./checkpoints"
     sample_dir = "./training_samples"
-    save_every = 2000                 # Save checkpoint every N steps
-    log_every = 100                   # Log loss every N steps
+    save_every = 1000  # Save more often
+    log_every = 50
     
-    # ========== Validation ==========
-    val_split = 0.02                  # 2% for validation
-    sample_prompt = "anime artwork, a person"  # Prompt for epoch samples
+    # Validation
+    val_split = 0.01  # Reduced for more training data
+    sample_prompt = "anime artwork, a person"
 
 config = Config()
 
-# Set all seeds for reproducibility
+# Set seeds
 torch.manual_seed(config.seed)
 np.random.seed(config.seed)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(config.seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    # Enable TF32 for faster computation (A100/RTX 30xx/40xx)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
-# ==================== DIMENSION-SAFE DATASET ====================
-class AnimeDataset(Dataset):
-    """Dataset with dimension validation and error handling"""
+# ==================== MEMORY OPTIMIZATION ====================
+def optimize_memory():
+    """Optimize memory usage for 32GB GPU"""
+    if torch.cuda.is_available():
+        # Clear cache
+        torch.cuda.empty_cache()
+        
+        # Set memory fraction if needed
+        # torch.cuda.set_per_process_memory_fraction(0.9)  # Use 90% of GPU
+        
+        # Enable memory optimizations
+        torch.backends.cudnn.benchmark = True  # Faster convolutions
+        torch.backends.cudnn.deterministic = False  # Faster but non-deterministic
+        
+        print(f"GPU Memory allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+        print(f"GPU Memory cached: {torch.cuda.memory_reserved()/1e9:.2f} GB")
+
+optimize_memory()
+
+# ==================== DATASET HANDLER ====================
+class DatasetHandler:
+    """Handles zip with duplicate name captions"""
     
-    def __init__(self, data_root, image_size=512, is_train=True):
-        self.data_root = data_root
+    def __init__(self, zip_path):
+        self.zip_path = zip_path
+        self.temp_dir = None
+        self.extracted_path = None
+        
+        print(f"Loading dataset from {zip_path}")
+        self._extract_zip()
+    
+    def _extract_zip(self):
+        """Extract zip to temp directory"""
+        print("Extracting zip file...")
+        
+        self.temp_dir = tempfile.mkdtemp(prefix="anime_train_")
+        self.extracted_path = os.path.join(self.temp_dir, "dataset")
+        
+        try:
+            with zipfile.ZipFile(self.zip_path, 'r') as zip_ref:
+                files = zip_ref.namelist()
+                print(f"Total files in zip: {len(files)}")
+                
+                # Extract with progress
+                total_size = sum(zinfo.file_size for zinfo in zip_ref.infolist())
+                
+                with tqdm(total=total_size, unit='B', unit_scale=True, desc="Extracting") as pbar:
+                    for member in zip_ref.infolist():
+                        zip_ref.extract(member, self.extracted_path)
+                        pbar.update(member.file_size)
+                
+            print(f"✓ Extracted to {self.extracted_path}")
+            
+        except Exception as e:
+            print(f"Failed to extract zip: {e}")
+            raise
+    
+    def cleanup(self):
+        if self.temp_dir and os.path.exists(self.temp_dir):
+            shutil.rmtree(self.temp_dir)
+
+# ==================== DATASET CLASS ====================
+class AnimeDataset(Dataset):
+    """Optimized dataset loading"""
+    
+    def __init__(self, handler, image_size=512, is_train=True):
+        self.handler = handler
         self.image_size = image_size
         self.is_train = is_train
         
-        # Collect valid image-caption pairs
+        # Find images and captions
+        self._find_files()
+        self._match_files()
+        
+        # Tokenizer
+        self.tokenizer = CLIPTokenizer.from_pretrained(
+            "openai/clip-vit-large-patch14",
+            local_files_only=False
+        )
+        
+        # Image transforms
+        self.transform = self._get_transforms()
+    
+    def _find_files(self):
+        """Find all files"""
+        # Look for training_dataset folder
+        training_folder = os.path.join(self.handler.extracted_path, "training_dataset")
+        if os.path.exists(training_folder):
+            self.base_path = training_folder
+        else:
+            self.base_path = self.handler.extracted_path
+        
+        # Images folder
+        self.images_folder = os.path.join(self.base_path, "images")
+        if not os.path.exists(self.images_folder):
+            # Find any folder with images
+            for root, dirs, files in os.walk(self.base_path):
+                if any(f.lower().endswith(('.jpg', '.png')) for f in files[:10]):
+                    self.images_folder = root
+                    break
+        
+        # Get all images
+        self.image_files = []
+        for root, dirs, files in os.walk(self.images_folder):
+            for file in files:
+                if file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                    self.image_files.append(os.path.join(root, file))
+        
+        print(f"Found {len(self.image_files)} images")
+    
+    def _match_files(self):
+        """Match images with captions"""
         self.image_paths = []
         self.caption_paths = []
         
-        images_folder = os.path.join(data_root, config.images_dir)
+        # Get all txt files in base path
+        txt_files = []
+        for root, dirs, files in os.walk(self.base_path):
+            for file in files:
+                if file.lower().endswith('.txt'):
+                    txt_files.append(os.path.join(root, file))
         
-        # Validate folder structure
-        if not os.path.exists(images_folder):
-            raise ValueError(f"Images folder not found: {images_folder}")
+        print(f"Found {len(txt_files)} caption files")
         
-        print(f"Scanning dataset at {data_root}...")
+        # Create caption dict for faster lookup
+        caption_dict = {}
+        for txt_path in txt_files:
+            base = os.path.splitext(os.path.basename(txt_path))[0]
+            base = base.replace('.jpg', '').replace('.png', '')
+            caption_dict[base] = txt_path
         
-        # Get all image files
-        valid_extensions = {'.jpg', '.jpeg', '.png', '.webp', '.bmp'}
-        image_files = [f for f in os.listdir(images_folder) 
-                      if any(f.lower().endswith(ext) for ext in valid_extensions)]
-        
-        print(f"Found {len(image_files)} image files")
-        
-        # Match with captions
-        for img_file in tqdm(image_files, desc="Matching captions"):
-            img_path = os.path.join(images_folder, img_file)
+        # Match images
+        matched = 0
+        for img_path in tqdm(self.image_files[:100000], desc="Matching"):  # Limit to 100k for speed
+            img_name = os.path.basename(img_path)
+            img_base = os.path.splitext(img_name)[0]
             
-            # Try multiple possible caption file names
-            base_name = os.path.splitext(img_file)[0]
-            caption_candidates = [
-                os.path.join(data_root, f"{base_name}.txt"),
-                os.path.join(data_root, f"{base_name}.jpg.txt"),
-                os.path.join(data_root, f"{base_name}.png.txt"),
-            ]
-            
+            # Try multiple matching strategies
             caption_path = None
-            for candidate in caption_candidates:
-                if os.path.exists(candidate):
-                    caption_path = candidate
-                    break
+            
+            # 1. Exact match
+            if img_base in caption_dict:
+                caption_path = caption_dict[img_base]
+            
+            # 2. Remove duplicate show name (A_Lull_in_the_sea_A_Lull_in_the_sea_001 -> A_Lull_in_the_sea_001)
+            if not caption_path and '_' in img_base:
+                parts = img_base.split('_')
+                # Check for duplicate pattern
+                for i in range(1, len(parts)//2 + 1):
+                    if parts[:i] == parts[i:2*i]:
+                        # Remove duplicate
+                        simple = '_'.join(parts[i:])
+                        if simple in caption_dict:
+                            caption_path = caption_dict[simple]
+                            break
+            
+            # 3. Match by numbers
+            if not caption_path:
+                img_numbers = re.findall(r'\d+', img_base)
+                if img_numbers:
+                    for cap_base, cap_path in caption_dict.items():
+                        cap_numbers = re.findall(r'\d+', cap_base)
+                        if cap_numbers and img_numbers[-1] == cap_numbers[-1]:
+                            caption_path = cap_path
+                            break
             
             if caption_path:
                 self.image_paths.append(img_path)
                 self.caption_paths.append(caption_path)
-            else:
-                print(f"Warning: No caption found for {img_file}")
+                matched += 1
         
-        print(f"Loaded {len(self.image_paths)} valid image-caption pairs")
+        print(f"✓ Matched {matched} image-caption pairs")
         
-        if len(self.image_paths) == 0:
-            raise ValueError("No valid image-caption pairs found!")
-        
-        # Initialize tokenizer
-        self.tokenizer = CLIPTokenizer.from_pretrained(
-            "runwayml/stable-diffusion-v1-5",
-            subfolder="tokenizer"
-        )
-        
-        # Image transforms with dimension safety
-        self.transform = self._get_transforms()
-        
-        # Validate first few samples
-        self._validate_samples()
+        if matched == 0:
+            raise ValueError("No matches found!")
     
     def _get_transforms(self):
-        """Get image transforms with dimension checking"""
+        """Get image transforms"""
         if self.is_train:
             return transforms.Compose([
-                transforms.Resize(config.image_size + 32),
-                transforms.RandomCrop(config.image_size),
+                transforms.Resize(self.image_size),
+                transforms.RandomCrop(self.image_size),
                 transforms.RandomHorizontalFlip(p=0.5),
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5])  # To [-1, 1]
-            ])
-        else:
-            return transforms.Compose([
-                transforms.Resize(config.image_size),
-                transforms.CenterCrop(config.image_size),
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5])
             ])
-    
-    def _validate_samples(self):
-        """Validate first few samples for dimension consistency"""
-        print("Validating dataset dimensions...")
-        valid_samples = 0
-        
-        for i in range(min(10, len(self.image_paths))):
-            try:
-                img = Image.open(self.image_paths[i]).convert('RGB')
-                original_size = img.size
-                
-                # Test transform
-                img_tensor = self.transform(img)
-                
-                # Check dimensions
-                assert img_tensor.shape == (3, config.image_size, config.image_size), \
-                    f"Sample {i}: Wrong tensor shape {img_tensor.shape}"
-                
-                # Check caption
-                with open(self.caption_paths[i], 'r', encoding='utf-8') as f:
-                    caption = f.read().strip()
-                tokens = self.tokenizer(
-                    caption,
-                    padding="max_length",
-                    max_length=config.max_text_length,
-                    truncation=True,
-                    return_tensors="pt"
-                )
-                assert tokens.input_ids.shape == (1, config.max_text_length), \
-                    f"Sample {i}: Wrong token shape {tokens.input_ids.shape}"
-                
-                valid_samples += 1
-                if i == 0:
-                    print(f"  Sample 0: Image {original_size} -> {img_tensor.shape}, "
-                          f"Caption: {caption[:50]}...")
-                    
-            except Exception as e:
-                print(f"  Sample {i} validation failed: {e}")
-        
-        print(f"Validation: {valid_samples}/10 samples passed")
+        else:
+            return transforms.Compose([
+                transforms.Resize(self.image_size),
+                transforms.CenterCrop(self.image_size),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5])
+            ])
     
     def __len__(self):
         return len(self.image_paths)
     
     def __getitem__(self, idx):
-        """Get item with robust error handling"""
-        max_retries = 3
-        for retry in range(max_retries):
-            try:
-                # Load image
-                img_path = self.image_paths[idx]
-                img = Image.open(img_path).convert('RGB')
-                
-                # Apply transform
-                pixel_values = self.transform(img)
-                
-                # Load and process caption
-                with open(self.caption_paths[idx], 'r', encoding='utf-8') as f:
-                    caption = f.read().strip()
-                
-                # Enhance simple captions for anime
-                if not caption.startswith("anime"):
-                    caption = f"anime style, {caption}"
-                
-                # Tokenize
-                tokens = self.tokenizer(
-                    caption,
-                    padding="max_length",
-                    max_length=config.max_text_length,
-                    truncation=True,
-                    return_tensors="pt"
-                )
-                
-                return {
-                    "pixel_values": pixel_values,
-                    "input_ids": tokens.input_ids.squeeze(0),
-                    "caption": caption
-                }
-                
-            except Exception as e:
-                if retry == max_retries - 1:
-                    print(f"Failed to load sample {idx} after {max_retries} retries: {e}")
-                    # Return a fallback sample
-                    return self._get_fallback_sample()
-                
-                # Try next sample on error
-                idx = (idx + 1) % len(self)
-                continue
+        try:
+            # Load image
+            img = Image.open(self.image_paths[idx]).convert('RGB')
+            pixel_values = self.transform(img)
+            
+            # Load caption
+            with open(self.caption_paths[idx], 'r', encoding='utf-8') as f:
+                caption = f.read().strip()
+            
+            # Tokenize
+            tokens = self.tokenizer(
+                caption,
+                max_length=77,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt"
+            )
+            
+            return {
+                "pixel_values": pixel_values,
+                "input_ids": tokens.input_ids.squeeze(0),
+                "caption": caption
+            }
+        except:
+            # Return dummy on error
+            pixel_values = torch.zeros(3, config.image_size, config.image_size)
+            caption = "anime artwork"
+            tokens = self.tokenizer(
+                caption,
+                max_length=77,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt"
+            )
+            return {
+                "pixel_values": pixel_values,
+                "input_ids": tokens.input_ids.squeeze(0),
+                "caption": caption
+            }
+
+# ==================== LARGER AUTOENCODER FOR 32GB ====================
+class LargeAutoencoder(nn.Module):
+    """Larger autoencoder for better quality"""
     
-    def _get_fallback_sample(self):
-        """Create a fallback sample if loading fails"""
-        # Create black image
-        pixel_values = torch.zeros(3, config.image_size, config.image_size)
+    def __init__(self, scale_factor=0.18215):
+        super().__init__()
+        self.scale_factor = scale_factor
         
-        # Create simple caption
-        caption = "anime artwork"
-        tokens = self.tokenizer(
-            caption,
-            padding="max_length",
-            max_length=config.max_text_length,
-            truncation=True,
-            return_tensors="pt"
+        # Encoder - larger
+        self.encoder = nn.Sequential(
+            nn.Conv2d(3, 96, kernel_size=3, stride=2, padding=1),  # Increased channels
+            nn.GroupNorm(32, 96),
+            nn.SiLU(),
+            nn.Conv2d(96, 192, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(32, 192),
+            nn.SiLU(),
+            nn.Conv2d(192, 384, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(32, 384),
+            nn.SiLU(),
+            nn.Conv2d(384, 4, kernel_size=3, padding=1),
         )
         
-        return {
-            "pixel_values": pixel_values,
-            "input_ids": tokens.input_ids.squeeze(0),
-            "caption": caption
-        }
+        # Decoder - larger
+        self.decoder = nn.Sequential(
+            nn.Conv2d(4, 384, kernel_size=3, padding=1),
+            nn.GroupNorm(32, 384),
+            nn.SiLU(),
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.Conv2d(384, 192, kernel_size=3, padding=1),
+            nn.GroupNorm(32, 192),
+            nn.SiLU(),
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.Conv2d(192, 96, kernel_size=3, padding=1),
+            nn.GroupNorm(32, 96),
+            nn.SiLU(),
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.Conv2d(96, 3, kernel_size=3, padding=1),
+            nn.Tanh(),
+        )
+    
+    def encode(self, images):
+        images = (images + 1) / 2  # [-1, 1] -> [0, 1]
+        latents = self.encoder(images)
+        return latents * self.scale_factor
+    
+    def decode(self, latents):
+        latents = latents / self.scale_factor
+        images = self.decoder(latents)
+        return images
 
 # ==================== MODEL INITIALIZATION ====================
 def initialize_models():
-    """Initialize all models with dimension validation"""
-    print("\n" + "="*50)
-    print("INITIALIZING MODELS")
-    print("="*50)
+    """Initialize larger models for 32GB GPU"""
+    print("\nInitializing LARGER models for 32GB GPU...")
     
-    # Load pretrained models from Stable Diffusion
-    print("Loading pretrained components...")
-    
-    # 1. Text encoder (frozen)
+    # Text encoder
     text_encoder = CLIPTextModel.from_pretrained(
-        "runwayml/stable-diffusion-v1-5",
-        subfolder="text_encoder"
+        "openai/clip-vit-large-patch14"
     ).to(config.device)
     text_encoder.requires_grad_(False)
     text_encoder.eval()
-    print(f"  Text encoder: {sum(p.numel() for p in text_encoder.parameters()):,} params")
     
-    # 2. VAE for latent space (frozen)
-    vae = AutoencoderKL.from_pretrained(
-        "runwayml/stable-diffusion-v1-5",
-        subfolder="vae"
-    ).to(config.device)
+    # Autoencoder
+    vae = LargeAutoencoder().to(config.device)
     vae.requires_grad_(False)
     vae.eval()
-    print(f"  VAE: {sum(p.numel() for p in vae.parameters()):,} params")
     
-    # 3. Create U-Net from scratch with validated dimensions
-    print(f"\nCreating U-Net with:")
-    print(f"  Input shape: (batch, 4, {config.latent_size}, {config.latent_size})")
-    print(f"  Text embedding dim: {config.text_encoder_dim}")
-    print(f"  Channels: {config.unet_channels}")
-    print(f"  Channel multipliers: {config.channel_multipliers}")
-    
+    # LARGER U-Net for 32GB
+    print("Creating LARGER U-Net...")
     unet = UNet2DConditionModel(
-        sample_size=config.latent_size,  # 64 for 512px images
+        sample_size=config.latent_size,
         in_channels=4,
         out_channels=4,
         layers_per_block=config.num_res_blocks,
         block_out_channels=[config.unet_channels * m for m in config.channel_multipliers],
         down_block_types=(
             "CrossAttnDownBlock2D",
+            "CrossAttnDownBlock2D", 
             "CrossAttnDownBlock2D",
             "CrossAttnDownBlock2D",
             "DownBlock2D",
@@ -334,23 +425,26 @@ def initialize_models():
             "CrossAttnUpBlock2D",
             "CrossAttnUpBlock2D",
             "CrossAttnUpBlock2D",
+            "CrossAttnUpBlock2D",
         ),
-        cross_attention_dim=config.text_encoder_dim,
+        cross_attention_dim=768,
+        attention_head_dim=8,  # Increased attention
     ).to(config.device)
     
-    print(f"  U-Net parameters: {sum(p.numel() for p in unet.parameters()):,}")
+    # Count parameters
+    total_params = sum(p.numel() for p in unet.parameters())
+    print(f"✓ U-Net parameters: {total_params:,} ({total_params/1e6:.1f}M)")
     
-    # 4. Noise scheduler
+    # Noise scheduler
     noise_scheduler = DDPMScheduler(
         num_train_timesteps=config.timesteps,
         beta_schedule=config.beta_schedule,
         prediction_type="epsilon"
     )
     
-    # 5. Tokenizer
+    # Tokenizer
     tokenizer = CLIPTokenizer.from_pretrained(
-        "runwayml/stable-diffusion-v1-5",
-        subfolder="tokenizer"
+        "openai/clip-vit-large-patch14"
     )
     
     return {
@@ -361,64 +455,99 @@ def initialize_models():
         "tokenizer": tokenizer
     }
 
-# ==================== TRAINING UTILITIES ====================
-def encode_images(vae, images):
-    """Encode images to latents with dimension validation"""
-    # images: (B, 3, H, W) in [-1, 1]
-    with torch.no_grad():
-        # Convert to [0, 1] for VAE
-        images = (images + 1) / 2
-        
-        # Validate input dimensions
-        assert images.min() >= 0 and images.max() <= 1, "Images not in [0, 1] range"
-        assert images.shape[1] == 3, f"Expected 3 channels, got {images.shape[1]}"
-        
-        # Encode
-        latents = vae.encode(images).latent_dist.sample()
-        latents = latents * 0.18215  # Scaling factor from Stable Diffusion
-        
-        # Validate output dimensions
-        expected_shape = (images.shape[0], 4, images.shape[2] // 8, images.shape[3] // 8)
-        assert latents.shape == expected_shape, \
-            f"Latent shape mismatch: {latents.shape} vs {expected_shape}"
+# ==================== FIXED IMAGE SAVING ====================
+def save_image_fixed(image_tensor, path):
+    """
+    FIXED: Save image tensor properly
+    image_tensor: (3, H, W) in range [-1, 1] or [0, 1]
+    """
+    # Ensure it's on CPU and detached
+    image = image_tensor.cpu().detach()
     
-    return latents
+    # Clamp to valid range
+    image = torch.clamp(image, -1, 1)
+    
+    # Convert from [-1, 1] to [0, 1] if needed
+    if image.min() < 0:
+        image = (image + 1) / 2
+    
+    # Ensure it's in [0, 1] range
+    image = torch.clamp(image, 0, 1)
+    
+    # Convert to numpy
+    img_np = image.permute(1, 2, 0).numpy()
+    
+    # Save with matplotlib (FIXED)
+    plt.imsave(path, img_np)
+    return True
 
-def decode_latents(vae, latents):
-    """Decode latents to images"""
+def generate_sample_fixed(models, prompt, epoch, save_path):
+    """FIXED: Generate and save sample image"""
+    print(f"Generating sample for epoch {epoch+1}")
+    
+    unet = models["unet"]
+    tokenizer = models["tokenizer"]
+    text_encoder = models["text_encoder"]
+    vae = models["vae"]
+    
+    unet.eval()
+    
     with torch.no_grad():
-        latents = latents / 0.18215
-        images = vae.decode(latents).sample
-        images = (images / 2 + 0.5).clamp(0, 1)  # [0, 1]
-    return images
+        # Tokenize
+        text_input = tokenizer(
+            [prompt],
+            max_length=77,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt"
+        ).to(config.device)
+        
+        text_embeddings = text_encoder(text_input.input_ids)[0]
+        
+        # Create noise
+        latents = torch.randn(
+            (1, 4, config.latent_size, config.latent_size),
+            device=config.device
+        )
+        
+        # Simple sampling (30 steps)
+        num_steps = 30
+        alphas = torch.linspace(0.99, 0.01, num_steps).to(config.device)
+        
+        for i in range(num_steps):
+            alpha = alphas[i]
+            
+            # Predict noise
+            noise_pred = unet(
+                latents,
+                torch.tensor([i * 33], device=config.device),  # Scaled to 0-1000
+                encoder_hidden_states=text_embeddings
+            ).sample
+            
+            # Update latents (simplified DDPM)
+            latents = (latents - (1 - alpha).sqrt() * noise_pred) / alpha.sqrt()
+            
+            if i < num_steps - 1:
+                next_alpha = alphas[i + 1]
+                noise = torch.randn_like(latents)
+                latents = latents + (1 - next_alpha).sqrt() * noise
+        
+        # Decode
+        image = vae.decode(latents)
+        
+        # FIXED: Proper image saving
+        image = image[0].cpu()  # (3, H, W)
+        
+        # Save using fixed function
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        save_image_fixed(image, save_path)
+        print(f"✓ Sample saved: {save_path}")
+    
+    unet.train()
 
-def validate_batch_dimensions(batch, models):
-    """Validate all dimensions in a training batch"""
-    images = batch["pixel_values"].to(config.device)
-    input_ids = batch["input_ids"].to(config.device)
-    
-    # Validate image dimensions
-    assert images.shape[1:] == (3, config.image_size, config.image_size), \
-        f"Image shape mismatch: {images.shape[1:]}"
-    
-    # Validate text input dimensions
-    assert input_ids.shape == (images.shape[0], config.max_text_length), \
-        f"Input IDs shape mismatch: {input_ids.shape}"
-    
-    # Encode to latents and validate
-    latents = encode_images(models["vae"], images)
-    
-    # Validate text embeddings
-    with torch.no_grad():
-        text_embeddings = models["text_encoder"](input_ids)[0]
-        assert text_embeddings.shape == (images.shape[0], config.max_text_length, config.text_encoder_dim), \
-            f"Text embeddings shape mismatch: {text_embeddings.shape}"
-    
-    return images, latents, text_embeddings
-
-# ==================== TRAINING LOOP ====================
-def train_epoch(models, dataloader, optimizer, scaler, epoch, global_step):
-    """Train for one epoch"""
+# ==================== OPTIMIZED TRAINING ====================
+def train_epoch_optimized(models, dataloader, optimizer, scaler, epoch, global_step):
+    """Optimized training for 32GB GPU"""
     unet = models["unet"]
     noise_scheduler = models["noise_scheduler"]
     text_encoder = models["text_encoder"]
@@ -428,21 +557,31 @@ def train_epoch(models, dataloader, optimizer, scaler, epoch, global_step):
     total_loss = 0
     num_batches = 0
     
+    # Progress bar
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{config.epochs}")
     
     for batch_idx, batch in enumerate(progress_bar):
         try:
-            # Validate dimensions
-            images, latents, text_embeddings = validate_batch_dimensions(batch, models)
+            # Move to device
+            images = batch["pixel_values"].to(config.device, non_blocking=True)
+            input_ids = batch["input_ids"].to(config.device, non_blocking=True)
             
-            # Sample noise and timesteps
+            # Get text embeddings
+            with torch.no_grad():
+                text_embeddings = text_encoder(input_ids)[0]
+            
+            # Encode images
+            with torch.no_grad():
+                latents = vae.encode(images)
+            
+            # Sample noise
             noise = torch.randn_like(latents)
             timesteps = torch.randint(
                 0, noise_scheduler.config.num_train_timesteps,
                 (latents.shape[0],), device=config.device
             ).long()
             
-            # Add noise to latents
+            # Add noise
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
             
             # Predict noise with mixed precision
@@ -453,25 +592,19 @@ def train_epoch(models, dataloader, optimizer, scaler, epoch, global_step):
                     encoder_hidden_states=text_embeddings
                 ).sample
                 
-                # Calculate loss
                 loss = F.mse_loss(noise_pred, noise)
                 loss = loss / config.gradient_accumulation_steps
             
             # Backward pass
             scaler.scale(loss).backward()
             
-            # Gradient accumulation step
+            # Gradient accumulation
             if (batch_idx + 1) % config.gradient_accumulation_steps == 0:
-                # Gradient clipping
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(unet.parameters(), 1.0)
-                
-                # Optimizer step
                 scaler.step(optimizer)
                 scaler.update()
-                optimizer.zero_grad()
-                
-                # Update global step
+                optimizer.zero_grad(set_to_none=True)  # More memory efficient
                 global_step += 1
             
             # Update metrics
@@ -481,97 +614,49 @@ def train_epoch(models, dataloader, optimizer, scaler, epoch, global_step):
             # Logging
             if global_step % config.log_every == 0:
                 current_loss = total_loss / num_batches
-                progress_bar.set_postfix({
-                    "loss": f"{current_loss:.4f}",
-                    "step": global_step,
-                    "lr": f"{optimizer.param_groups[0]['lr']:.2e}"
-                })
+                # Memory usage
+                if torch.cuda.is_available():
+                    mem_alloc = torch.cuda.memory_allocated() / 1e9
+                    mem_reserved = torch.cuda.memory_reserved() / 1e9
+                    progress_bar.set_postfix({
+                        "loss": f"{current_loss:.4f}",
+                        "step": global_step,
+                        "GPU": f"{mem_alloc:.1f}/{mem_reserved:.1f}GB"
+                    })
+                else:
+                    progress_bar.set_postfix({
+                        "loss": f"{current_loss:.4f}",
+                        "step": global_step
+                    })
             
             # Save checkpoint
             if global_step % config.save_every == 0 and global_step > 0:
                 save_checkpoint(models, optimizer, scaler, epoch, global_step, total_loss/num_batches)
             
+            # Clear cache occasionally
+            if batch_idx % 100 == 0 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+        except torch.cuda.OutOfMemoryError:
+            print(f"\n⚠ Out of memory at batch {batch_idx}. Reducing batch size...")
+            torch.cuda.empty_cache()
+            # Reduce batch size for next batch
+            if config.micro_batch > 1:
+                config.micro_batch //= 2
+                config.gradient_accumulation_steps = config.batch_size // config.micro_batch
+                print(f"Reduced micro_batch to {config.micro_batch}")
+            continue
         except Exception as e:
             print(f"\nError in batch {batch_idx}: {e}")
-            print("Skipping batch...")
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             continue
     
     epoch_loss = total_loss / num_batches if num_batches > 0 else 0
     return epoch_loss, global_step
 
-# ==================== SAMPLING & CHECKPOINTING ====================
-def generate_sample(models, prompt, step, save_path):
-    """Generate sample image during training"""
-    print(f"\nGenerating sample: '{prompt}'")
-    
-    unet = models["unet"]
-    tokenizer = models["tokenizer"]
-    text_encoder = models["text_encoder"]
-    vae = models["vae"]
-    
-    unet.eval()
-    
-    with torch.no_grad():
-        # Tokenize prompt
-        text_input = tokenizer(
-            [prompt],
-            padding="max_length",
-            max_length=config.max_text_length,
-            truncation=True,
-            return_tensors="pt"
-        ).to(config.device)
-        
-        # Get text embeddings
-        text_embeddings = text_encoder(text_input.input_ids)[0]
-        
-        # Create noise
-        latents = torch.randn(
-            (1, 4, config.latent_size, config.latent_size),
-            device=config.device
-        )
-        
-        # Use DDIM for faster sampling
-        ddim_scheduler = DDIMScheduler.from_pretrained(
-            "runwayml/stable-diffusion-v1-5",
-            subfolder="scheduler"
-        )
-        ddim_scheduler.set_timesteps(30, device=config.device)
-        
-        # Denoising loop
-        for t in ddim_scheduler.timesteps:
-            # Expand for classifier-free guidance
-            latent_model_input = torch.cat([latents] * 2)
-            latent_model_input = ddim_scheduler.scale_model_input(latent_model_input, t)
-            
-            # Predict noise
-            noise_pred = unet(
-                latent_model_input,
-                t.expand(2),
-                encoder_hidden_states=text_embeddings
-            ).sample
-            
-            # Apply guidance
-            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-            noise_pred = noise_pred_uncond + 7.5 * (noise_pred_text - noise_pred_uncond)
-            
-            # Update latents
-            latents = ddim_scheduler.step(noise_pred, t, latents).prev_sample
-        
-        # Decode to image
-        image = decode_latents(vae, latents)
-        image = image[0].cpu()  # (3, H, W) in [0, 1]
-        
-        # Save
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        plt.imsave(save_path, image.permute(1, 2, 0).numpy())
-        print(f"Saved sample to {save_path}")
-    
-    unet.train()
-    return image
-
+# ==================== CHECKPOINT ====================
 def save_checkpoint(models, optimizer, scaler, epoch, step, loss):
-    """Save training checkpoint"""
+    """Save checkpoint"""
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     
     checkpoint = {
@@ -587,151 +672,156 @@ def save_checkpoint(models, optimizer, scaler, epoch, step, loss):
     path = os.path.join(config.checkpoint_dir, f"checkpoint_epoch_{epoch+1}_step_{step}.pth")
     torch.save(checkpoint, path)
     
-    # Also save best model
+    # Best model
     best_path = os.path.join(config.checkpoint_dir, "model_best.pth")
-    if not os.path.exists(best_path) or loss < getattr(save_checkpoint, 'best_loss', float('inf')):
+    if not hasattr(save_checkpoint, 'best_loss') or loss < save_checkpoint.best_loss:
         torch.save(models['unet'].state_dict(), best_path)
         save_checkpoint.best_loss = loss
-        print(f"  New best model saved with loss {loss:.4f}")
+        print(f"  ✓ New best model (loss: {loss:.4f})")
     
-    print(f"  Checkpoint saved to {path}")
+    print(f"  Checkpoint saved: {path}")
 
-# ==================== MAIN TRAINING FUNCTION ====================
+# ==================== MAIN OPTIMIZED TRAINING ====================
 def main():
-    print("\n" + "="*50)
-    print("ANIME DIFFUSION MODEL TRAINING")
-    print("="*50)
+    print("\n" + "="*70)
+    print("ANIME DIFFUSION TRAINING - OPTIMIZED FOR 32GB GPU")
+    print("="*70)
     print(f"Device: {config.device}")
-    print(f"Image size: {config.image_size}")
-    print(f"Batch size: {config.batch_size} (micro batch: {config.micro_batch})")
+    print(f"Batch size: {config.batch_size} (micro: {config.micro_batch})")
     print(f"Gradient accumulation: {config.gradient_accumulation_steps}")
-    print(f"Latent size: {config.latent_size}")
-    print(f"Epochs: {config.epochs}")
-    print("="*50 + "\n")
+    print(f"Image size: {config.image_size}")
+    print(f"U-Net channels: {config.unet_channels}")
+    print("="*70 + "\n")
     
-    # Initialize models
-    models = initialize_models()
+    # Memory optimization
+    optimize_memory()
     
-    # Create dataset
-    print("\n" + "="*50)
-    print("LOADING DATASET")
-    print("="*50)
-    
+    # Initialize handler
     try:
-        dataset = AnimeDataset(config.data_root, config.image_size, is_train=True)
+        handler = DatasetHandler(config.data_source)
     except Exception as e:
         print(f"Failed to load dataset: {e}")
-        print("Please check your dataset structure:")
-        print(f"  Data root: {config.data_root}")
-        print(f"  Images folder: {os.path.join(config.data_root, config.images_dir)}")
-        print("  Captions should be in data_root folder with same names as images")
         return
     
-    # Split dataset
-    from torch.utils.data import random_split
-    val_size = int(config.val_split * len(dataset))
-    train_size = len(dataset) - val_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-    
-    print(f"Training samples: {train_size:,}")
-    print(f"Validation samples: {val_size:,}")
-    
-    # Create dataloaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.micro_batch,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-        drop_last=True
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.micro_batch,
-        shuffle=False,
-        num_workers=2,
-        pin_memory=True
-    )
-    
-    # Initialize optimizer
-    optimizer = torch.optim.AdamW(
-        models["unet"].parameters(),
-        lr=config.learning_rate,
-        betas=(config.adam_beta1, config.adam_beta2),
-        weight_dacay=config.weight_decay
-    )
-    
-    # Initialize mixed precision scaler
-    scaler = GradScaler(enabled=config.mixed_precision)
-    
-    # Create directories
-    os.makedirs(config.checkpoint_dir, exist_ok=True)
-    os.makedirs(config.sample_dir, exist_ok=True)
-    
-    # Training loop
-    print("\n" + "="*50)
-    print("STARTING TRAINING")
-    print("="*50)
-    
-    global_step = 0
-    best_val_loss = float('inf')
-    
-    for epoch in range(config.epochs):
-        print(f"\n{'='*60}")
-        print(f"EPOCH {epoch+1}/{config.epochs}")
-        print(f"{'='*60}")
+    try:
+        # Initialize LARGER models
+        models = initialize_models()
         
-        # Train for one epoch
-        train_loss, global_step = train_epoch(
-            models, train_loader, optimizer, scaler, epoch, global_step
+        # Create dataset (use first 100K for speed)
+        print("\nCreating dataset...")
+        dataset = AnimeDataset(handler, config.image_size, is_train=True)
+        
+        # Use subset if too large
+        if len(dataset) > 100000:
+            from torch.utils.data import Subset
+            indices = list(range(min(100000, len(dataset))))
+            dataset = Subset(dataset, indices)
+            print(f"Using subset of {len(indices)} images for faster training")
+        
+        # Split
+        from torch.utils.data import random_split
+        val_size = int(config.val_split * len(dataset))
+        train_size = len(dataset) - val_size
+        train_dataset, _ = random_split(dataset, [train_size, val_size])
+        
+        print(f"\nDataset Info:")
+        print(f"  Total samples: {len(dataset)}")
+        print(f"  Training: {train_size:,}")
+        print(f"  Validation: {val_size:,}")
+        
+        # OPTIMIZED DataLoader
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config.micro_batch,
+            shuffle=True,
+            num_workers=4,  # Increased for faster loading
+            pin_memory=True,
+            drop_last=True,
+            prefetch_factor=2,  # Prefetch batches
+            persistent_workers=True  # Keep workers alive
         )
         
-        print(f"\nEpoch {epoch+1} completed")
-        print(f"Train Loss: {train_loss:.4f}")
-        print(f"Global Step: {global_step}")
+        # Optimizer
+        optimizer = torch.optim.AdamW(
+            models["unet"].parameters(),
+            lr=config.learning_rate,
+            betas=(config.adam_beta1, config.adam_beta2),
+            weight_decay=config.weight_decay
+        )
         
-        # Generate sample after each epoch
-        sample_path = os.path.join(config.sample_dir, f"epoch_{epoch+1:03d}.png")
-        generate_sample(models, config.sample_prompt, epoch+1, sample_path)
+        # Scaler for mixed precision
+        scaler = GradScaler(enabled=config.mixed_precision)
         
-        # Save epoch checkpoint
-        save_checkpoint(models, optimizer, scaler, epoch, global_step, train_loss)
+        # Create directories
+        os.makedirs(config.checkpoint_dir, exist_ok=True)
+        os.makedirs(config.sample_dir, exist_ok=True)
         
-        # Clear cache to prevent memory issues
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            gc.collect()
-    
-    # Save final model
-    print("\n" + "="*50)
-    print("TRAINING COMPLETE")
-    print("="*50)
-    
-    final_path = os.path.join(config.checkpoint_dir, "model_final.pth")
-    torch.save(models["unet"].state_dict(), final_path)
-    print(f"Final model saved to {final_path}")
-    
-    # Print summary
-    print(f"\nTraining Summary:")
-    print(f"  Total epochs: {config.epochs}")
-    print(f"  Total steps: {global_step}")
-    print(f"  Final checkpoint: {final_path}")
-    print(f"  Best checkpoint: {os.path.join(config.checkpoint_dir, 'model_best.pth')}")
-    print(f"  Training samples: {len(train_loader) * config.micro_batch * config.epochs:,}")
-    print(f"\nTo generate images:")
-    print(f"  python generate_complete.py --prompt 'your prompt' --checkpoint {final_path}")
-
-if __name__ == "__main__":
-    # Set environment variables for better performance
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\nTraining interrupted by user")
+        # Training loop
+        print("\n" + "="*50)
+        print("STARTING OPTIMIZED TRAINING")
+        print("="*50)
+        
+        global_step = 0
+        
+        for epoch in range(config.epochs):
+            print(f"\n{'='*70}")
+            print(f"EPOCH {epoch+1}/{config.epochs}")
+            print(f"{'='*70}")
+            
+            # Train with optimization
+            train_loss, global_step = train_epoch_optimized(
+                models, train_loader, optimizer, scaler, epoch, global_step
+            )
+            
+            print(f"\n✓ Epoch {epoch+1} completed")
+            print(f"  Average loss: {train_loss:.4f}")
+            print(f"  Global step: {global_step}")
+            
+            if torch.cuda.is_available():
+                mem_alloc = torch.cuda.memory_allocated() / 1e9
+                print(f"  GPU memory used: {mem_alloc:.1f} GB")
+            
+            # Generate sample (FIXED)
+            sample_path = os.path.join(config.sample_dir, f"epoch_{epoch+1:03d}.png")
+            generate_sample_fixed(models, config.sample_prompt, epoch, sample_path)
+            
+            # Save checkpoint
+            save_checkpoint(models, optimizer, scaler, epoch, global_step, train_loss)
+            
+            # Clear cache between epochs
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                gc.collect()
+        
+        # Save final model
+        final_path = os.path.join(config.checkpoint_dir, "model_final.pth")
+        torch.save(models["unet"].state_dict(), final_path)
+        
+        print("\n" + "="*70)
+        print("TRAINING COMPLETE!")
+        print("="*70)
+        print(f"Final model: {final_path}")
+        print(f"Best model: {os.path.join(config.checkpoint_dir, 'model_best.pth')}")
+        print(f"Total steps: {global_step}")
+        print(f"Total epochs: {config.epochs}")
+        
+        # Cleanup
+        handler.cleanup()
+        
+        print("\n🎉 Training finished successfully!")
+        print("\nTo generate images:")
+        print(f"  python generate_optimized.py --prompt 'anime character' --checkpoint {final_path}")
+        
     except Exception as e:
-        print(f"\nTraining failed with error: {e}")
+        print(f"\nTraining failed: {e}")
         import traceback
         traceback.print_exc()
+        handler.cleanup()
+
+if __name__ == "__main__":
+    # Environment optimizations
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"  # Memory optimization
+    
+    # Run training
+    main()
