@@ -1,0 +1,7 @@
+cd /workspace
+python3 -m venv testing_env
+source testing_env/bin/activate
+
+pip install torch diffusers==0.29.0 transformers==4.41.2 accelerate==0.31.0 safetensors
+
+python finetune.py
